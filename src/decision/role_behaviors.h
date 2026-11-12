@@ -43,20 +43,16 @@ private:
 };
 
 /// Walk-to-formation behavior shared by CBM, ST, CBL, CBR, and CDM.
-///
-/// The defensive variant clips the planner against opponents already past the
-/// current ball line.
 class SimpleRoleBehavior final : public RoleBehavior {
 public:
-    SimpleRoleBehavior(int role_id, bool defensive_opponent_clip)
-        : role_id_(role_id), defensive_opponent_clip_(defensive_opponent_clip) {}
+    explicit SimpleRoleBehavior(int role_id)
+        : role_id_(role_id) {}
     bool matches(const Blackboard& blackboard) const override;
     HighLevelCommand make_command(
         const world::WorldSnapshot& snapshot,
         const Blackboard& blackboard) const override;
 private:
     int role_id_;
-    bool defensive_opponent_clip_;
     mutable APState relay_state_;
 };
 
@@ -74,6 +70,20 @@ public:
 void reset_role_behavior_state();
 
 int current_role_from_blackboard(const Blackboard& blackboard);
+
+/// Builds a speed-limited, obstacle-aware command for an absolute walk target.
+///
+/// This is the common entry point for role movement so set plays, goalkeeper
+/// positioning, and open play all share the same collision envelope.
+WalkCommand make_avoiding_walk_command(
+    const std::array<double, 2>& target_position_m,
+    const world::WorldSnapshot& snapshot,
+    std::optional<double> opponent_x_threshold = std::nullopt,
+    bool avoid_field_boundaries = true,
+    bool orient_to_ball = true,
+    std::optional<int> role_id = std::nullopt,
+    bool suppress_heading_slowdown = false,
+    bool avoid_obstacles = true);
 
 /// Selects the behavior matching the current role, if one is available.
 std::optional<HighLevelCommand> select_role_behavior(

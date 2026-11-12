@@ -29,7 +29,6 @@ constexpr double kAStarResolutionM = 0.5;
 constexpr double kAStarStartRelaxM = 0.8;
 constexpr double kAStarLineSafetyMarginM = 0.05;
 constexpr double kAStarFieldSafetyMarginM = 0.15;
-constexpr double kAStarForwardGoalExtensionM = 1.2;
 constexpr double kAStarUnboundedPaddingM = 2.0;
 constexpr double kBoundarySoftCost = 1.5;
 
@@ -40,6 +39,11 @@ constexpr double kWalkProtectedApHardObstacleRadiusM = 1.15;
 constexpr double kWalkProtectedApSoftObstacleRadiusM = 2.8;
 constexpr double kWalkProtectedApObstacleCost = 7.0;
 constexpr double kWalkLookaheadM = 2.0;
+constexpr double kObstaclePredictionHorizonS = 0.6;
+constexpr double kObstacleMaxPredictedSpeedMps = 4.0;
+constexpr double kObstacleStaleGrowthMps = 0.35;
+constexpr double kObstacleMaxStaleTimeS = 2.0;
+constexpr double kSpeedScaleFullClearanceM = 0.75;
 
 constexpr double kHalfLengthM = field_geometry::kActualHalfLengthM;
 constexpr double kHalfWidthM = field_geometry::kActualHalfWidthM;
@@ -50,6 +54,8 @@ constexpr double kFieldMarginM = field_geometry::kWalkPlannerFieldMarginM;
 
 struct Obstacle {
     Position2 position{0.0, 0.0};
+    Position2 velocity{0.0, 0.0};
+    double observed_age_s{0.0};
     bool protects_ap{false};
 };
 
@@ -66,8 +72,9 @@ struct PlannerConfig {
     double protected_ap_soft_obstacle_radius_m{0.0};
     double protected_ap_obstacle_cost{0.0};
     double lookahead_m{kWalkLookaheadM};
+    double prediction_horizon_s{kObstaclePredictionHorizonS};
+    double speed_scale_full_clearance_m{kSpeedScaleFullClearanceM};
     bool avoid_field_boundaries{true};
-    bool disable_forward_boundary{false};
 };
 
 struct PlanningBounds {
@@ -132,6 +139,15 @@ struct QueueEntryGreater {
     }
 };
 
+Position2 bounded_velocity(const Position2& velocity) {
+    const double speed = math::norm2(velocity);
+    if (speed <= kObstacleMaxPredictedSpeedMps) {
+        return velocity;
+    }
+    const double scale = kObstacleMaxPredictedSpeedMps / speed;
+    return {velocity[0] * scale, velocity[1] * scale};
+}
+
 void collect_obstacles(
     ObstacleBuffer& out,
     const world::WorldSnapshot& snapshot,
@@ -142,12 +158,18 @@ void collect_obstacles(
     out.count = 0;
 
     if (include_opponents) {
-        for (const auto& opp : collect_known_opponent_positions(snapshot)) {
+        for (const auto& opp : collect_known_opponents(snapshot)) {
             if (out.count >= kMaxObstacles) break;
-            if (opponent_x_threshold.has_value() && opp[0] >= opponent_x_threshold.value()) {
+            if (opponent_x_threshold.has_value() &&
+                opp.position_m[0] >= opponent_x_threshold.value()) {
                 continue;
             }
-            out.data[out.count++] = {opp, false};
+            out.data[out.count++] = {
+                opp.position_m,
+                bounded_velocity(opp.velocity_mps),
+                opp.age_s,
+                false,
+            };
         }
     }
 
@@ -156,8 +178,15 @@ void collect_obstacles(
         if (mate.player_number == self_player_number) continue;
         if (!all_teammates && !mate.fallen) continue;
         if (!mate.seen && (snapshot.server_time - mate.last_seen_time > 2.0)) continue;
+        const Position2 velocity =
+            mate.velocity_valid &&
+                    snapshot.server_time - mate.last_seen_time <= 0.5
+            ? Position2{mate.velocity_mps[0], mate.velocity_mps[1]}
+            : Position2{0.0, 0.0};
         out.data[out.count++] = {
             {mate.position_m[0], mate.position_m[1]},
+            bounded_velocity(velocity),
+            std::max(0.0, snapshot.server_time - mate.last_seen_time),
             mate.comm_role == RoleManager::ROLE_AP,
         };
     }
@@ -170,7 +199,12 @@ double heading_to(const Position2& origin, const Position2& target) {
 WalkPlan make_direct_plan(
     const Position2& origin,
     const Position2& target) {
-    return {heading_to(origin, target)};
+    return {
+        heading_to(origin, target),
+        1.0,
+        std::numeric_limits<double>::infinity(),
+        true,
+    };
 }
 
 PlanningBounds make_planning_bounds(
@@ -185,9 +219,6 @@ PlanningBounds make_planning_bounds(
             -kHalfWidthM + kAStarFieldSafetyMarginM,
             kHalfWidthM - kAStarFieldSafetyMarginM,
         };
-        if (config.disable_forward_boundary) {
-            bounds.max_x = kHalfLengthM + kAStarForwardGoalExtensionM;
-        }
     } else {
         bounds = {
             -kHalfLengthM - kAStarUnboundedPaddingM,
@@ -250,20 +281,14 @@ double boundary_traversal_cost(const Position2& position, const PlannerConfig& c
     };
 
     const double left = add_boundary(position[0] + kHalfLengthM);
+    const double right = add_boundary(kHalfLengthM - position[0]);
     const double top = add_boundary(kHalfWidthM - position[1]);
     const double bottom = add_boundary(position[1] + kHalfWidthM);
-    if (!std::isfinite(left) || !std::isfinite(top) || !std::isfinite(bottom)) {
+    if (!std::isfinite(left) || !std::isfinite(right) ||
+        !std::isfinite(top) || !std::isfinite(bottom)) {
         return std::numeric_limits<double>::infinity();
     }
-    cost += left + top + bottom;
-
-    if (!config.disable_forward_boundary) {
-        const double right = add_boundary(kHalfLengthM - position[0]);
-        if (!std::isfinite(right)) {
-            return std::numeric_limits<double>::infinity();
-        }
-        cost += right;
-    }
+    cost += left + right + top + bottom;
     return cost;
 }
 
@@ -272,20 +297,44 @@ bool near_planned_boundary(const Position2& position, const PlannerConfig& confi
         return false;
     }
 
-    if (position[0] + kHalfLengthM < kFieldMarginM ||
-        kHalfWidthM - position[1] < kFieldMarginM ||
-        position[1] + kHalfWidthM < kFieldMarginM) {
-        return true;
-    }
+    return position[0] + kHalfLengthM < kFieldMarginM ||
+           kHalfLengthM - position[0] < kFieldMarginM ||
+           kHalfWidthM - position[1] < kFieldMarginM ||
+           position[1] + kHalfWidthM < kFieldMarginM;
+}
 
-    return !config.disable_forward_boundary &&
-           kHalfLengthM - position[0] < kFieldMarginM;
+Position2 predicted_obstacle_position(
+    const Obstacle& obstacle,
+    const PlannerConfig& config) {
+    return {
+        obstacle.position[0] + obstacle.velocity[0] * config.prediction_horizon_s,
+        obstacle.position[1] + obstacle.velocity[1] * config.prediction_horizon_s,
+    };
+}
+
+double obstacle_swept_distance(
+    const Position2& position,
+    const Obstacle& obstacle,
+    const PlannerConfig& config) {
+    return math::point_segment_distance(
+        position,
+        obstacle.position,
+        predicted_obstacle_position(obstacle, config));
+}
+
+double stale_obstacle_growth_m(const Obstacle& obstacle) {
+    return std::clamp(
+               obstacle.observed_age_s,
+               0.0,
+               kObstacleMaxStaleTimeS) *
+           kObstacleStaleGrowthMps;
 }
 
 double hard_radius_for_obstacle(const PlannerConfig& config, const Obstacle& obstacle) {
-    return obstacle.protects_ap
+    const double base = obstacle.protects_ap
         ? std::max(config.hard_obstacle_radius_m, config.protected_ap_hard_obstacle_radius_m)
         : config.hard_obstacle_radius_m;
+    return base + stale_obstacle_growth_m(obstacle);
 }
 
 double soft_radius_for_obstacle(
@@ -295,7 +344,9 @@ double soft_radius_for_obstacle(
     const double configured_soft = obstacle.protects_ap
         ? std::max(config.soft_obstacle_radius_m, config.protected_ap_soft_obstacle_radius_m)
         : config.soft_obstacle_radius_m;
-    return std::max(configured_soft, hard_radius_m);
+    return std::max(
+        configured_soft + stale_obstacle_growth_m(obstacle),
+        hard_radius_m);
 }
 
 double cost_for_obstacle(const PlannerConfig& config, const Obstacle& obstacle) {
@@ -323,7 +374,7 @@ double obstacle_traversal_cost(
         const double hard_radius = hard_radius_for_obstacle(config, obstacle);
         const double soft_radius = soft_radius_for_obstacle(config, obstacle, hard_radius);
         const double cost_band = std::max(soft_radius - hard_radius, 1e-3);
-        const double distance_m = math::planar_dist(position, obstacle.position);
+        const double distance_m = obstacle_swept_distance(position, obstacle, config);
         if (!start_relaxed && distance_m < hard_radius) {
             return std::numeric_limits<double>::infinity();
         }
@@ -356,6 +407,43 @@ double cell_traversal_cost(
     return 1.0 + obstacle_cost + boundary_cost;
 }
 
+double cross_2d(const Position2& a, const Position2& b, const Position2& c) {
+    return (b[0] - a[0]) * (c[1] - a[1]) -
+           (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+bool segments_intersect(
+    const Position2& a,
+    const Position2& b,
+    const Position2& c,
+    const Position2& d) {
+    constexpr double kEpsilon = 1.0e-9;
+    const double ab_c = cross_2d(a, b, c);
+    const double ab_d = cross_2d(a, b, d);
+    const double cd_a = cross_2d(c, d, a);
+    const double cd_b = cross_2d(c, d, b);
+    return ((ab_c > kEpsilon && ab_d < -kEpsilon) ||
+            (ab_c < -kEpsilon && ab_d > kEpsilon)) &&
+           ((cd_a > kEpsilon && cd_b < -kEpsilon) ||
+            (cd_a < -kEpsilon && cd_b > kEpsilon));
+}
+
+double segment_segment_distance(
+    const Position2& a,
+    const Position2& b,
+    const Position2& c,
+    const Position2& d) {
+    if (segments_intersect(a, b, c, d)) {
+        return 0.0;
+    }
+    return std::min({
+        math::point_segment_distance(a, c, d),
+        math::point_segment_distance(b, c, d),
+        math::point_segment_distance(c, a, b),
+        math::point_segment_distance(d, a, b),
+    });
+}
+
 bool line_segment_safe(
     const Position2& start,
     const Position2& end,
@@ -369,7 +457,12 @@ bool line_segment_safe(
     for (int i = 0; i < obstacles.count; ++i) {
         const double hard_radius = hard_radius_for_obstacle(config, obstacles.data[i]);
         const double safe_distance = hard_radius + kAStarLineSafetyMarginM;
-        if (math::point_segment_distance(obstacles.data[i].position, start, end) < safe_distance) {
+        if (segment_segment_distance(
+                start,
+                end,
+                obstacles.data[i].position,
+                predicted_obstacle_position(obstacles.data[i], config)) <
+            safe_distance) {
             return false;
         }
     }
@@ -396,6 +489,55 @@ std::vector<Position2> reconstruct_path(
     return path;
 }
 
+int choose_feasible_goal(
+    const AStarGrid& grid,
+    const Position2& goal,
+    const ObstacleBuffer& obstacles,
+    const PlannerConfig& config) {
+    const Position2 no_relaxation_start{-1.0e6, -1.0e6};
+    const int nominal = grid.nearest_index(goal);
+    if (std::isfinite(cell_traversal_cost(
+            grid.position(nominal), obstacles, config, no_relaxation_start))) {
+        return nominal;
+    }
+
+    // The tactical target may be occupied by a player. Search a small ring
+    // around it for the closest traversable cell instead of steering into a
+    // hard obstacle and repeatedly replanning against an unreachable point.
+    constexpr int kGoalSearchCells = 6;
+    int best_index = -1;
+    double best_distance_sq = std::numeric_limits<double>::infinity();
+    for (int radius = 1; radius <= kGoalSearchCells; ++radius) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                if (std::abs(dx) != radius && std::abs(dy) != radius) {
+                    continue;
+                }
+                const int cx = grid.cell_x(goal[0]) + dx;
+                const int cy = grid.cell_y(goal[1]) + dy;
+                if (!grid.contains_cell(cx, cy)) {
+                    continue;
+                }
+                const int index = grid.index(cx, cy);
+                const Position2 candidate = grid.position(index);
+                if (!std::isfinite(cell_traversal_cost(
+                        candidate, obstacles, config, no_relaxation_start))) {
+                    continue;
+                }
+                const double distance_sq = math::sq_dist2(candidate, goal);
+                if (distance_sq < best_distance_sq) {
+                    best_distance_sq = distance_sq;
+                    best_index = index;
+                }
+            }
+        }
+        if (best_index >= 0) {
+            break;
+        }
+    }
+    return best_index >= 0 ? best_index : nominal;
+}
+
 std::optional<std::vector<Position2>> find_astar_path(
     const Position2& origin,
     const Position2& target,
@@ -407,7 +549,8 @@ std::optional<std::vector<Position2>> find_astar_path(
     const Position2 start = clamp_to_bounds(origin, bounds);
     const Position2 goal = clamp_to_bounds(target, bounds);
     const int start_idx = grid.nearest_index(start);
-    const int goal_idx = grid.nearest_index(goal);
+    const int goal_idx = choose_feasible_goal(grid, goal, obstacles, config);
+    const Position2 search_goal = grid.position(goal_idx);
 
     if (start_idx == goal_idx) {
         return std::vector<Position2>{start, goal};
@@ -419,10 +562,10 @@ std::optional<std::vector<Position2>> find_astar_path(
 
     nodes[start_idx].g = 0.0;
     nodes[start_idx].parent = -1;
-    open.push({start_idx, heuristic(start, goal), 0.0});
+    open.push({start_idx, heuristic(start, search_goal), 0.0});
 
     int best_idx = start_idx;
-    double best_h = heuristic(start, goal);
+    double best_h = heuristic(start, search_goal);
 
     constexpr std::array<int, 8> kDx{{1, 1, 0, -1, -1, -1, 0, 1}};
     constexpr std::array<int, 8> kDy{{0, 1, 1, 1, 0, -1, -1, -1}};
@@ -438,7 +581,7 @@ std::optional<std::vector<Position2>> find_astar_path(
         current.closed = true;
 
         const Position2 current_position = grid.position(entry.index);
-        const double current_h = heuristic(current_position, goal);
+        const double current_h = heuristic(current_position, search_goal);
         if (current_h < best_h) {
             best_h = current_h;
             best_idx = entry.index;
@@ -484,14 +627,15 @@ std::optional<std::vector<Position2>> find_astar_path(
             nodes[next_idx].parent = entry.index;
             open.push({
                 next_idx,
-                tentative_g + heuristic(next_position, goal),
+                tentative_g + heuristic(next_position, search_goal),
                 tentative_g,
             });
         }
     }
 
-    const double initial_h = heuristic(start, goal);
-    if (best_idx != start_idx && best_h < initial_h - kAStarResolutionM) {
+    const double initial_h = heuristic(start, search_goal);
+    if (best_idx != start_idx &&
+        best_h < initial_h - kAStarStartRelaxM) {
         return reconstruct_path(grid, nodes, start_idx, best_idx);
     }
     return std::nullopt;
@@ -526,13 +670,55 @@ Position2 select_waypoint(
     return candidate;
 }
 
+double minimum_waypoint_clearance(
+    const Position2& waypoint,
+    const ObstacleBuffer& obstacles,
+    const PlannerConfig& config) {
+    double minimum = std::numeric_limits<double>::infinity();
+    if (config.avoid_field_boundaries) {
+        minimum = std::min({
+            waypoint[0] + kHalfLengthM,
+            kHalfLengthM - waypoint[0],
+            waypoint[1] + kHalfWidthM,
+            kHalfWidthM - waypoint[1],
+        });
+    }
+    for (int i = 0; i < obstacles.count; ++i) {
+        const auto& obstacle = obstacles.data[i];
+        const double boundary_radius = hard_radius_for_obstacle(config, obstacle);
+        const double distance = obstacle_swept_distance(waypoint, obstacle, config);
+        minimum = std::min(minimum, distance - boundary_radius);
+    }
+    return minimum;
+}
+
+double speed_scale_for_clearance(
+    double clearance_m,
+    const PlannerConfig& config) {
+    if (!std::isfinite(clearance_m)) {
+        return 1.0;
+    }
+    if (clearance_m <= 0.0) {
+        return 0.0;
+    }
+    return std::clamp(
+        clearance_m / std::max(config.speed_scale_full_clearance_m, 1.0e-3),
+        0.2,
+        1.0);
+}
+
 WalkPlan compute_astar_plan(
     const Position2& origin,
     const Position2& target,
     const ObstacleBuffer& obstacles,
     const PlannerConfig& config) {
     if (math::planar_dist(origin, target) < 1e-4) {
-        return {0.0};
+        return {
+            0.0,
+            0.0,
+            0.0,
+            true,
+        };
     }
 
     const bool obstacles_disabled =
@@ -545,12 +731,23 @@ WalkPlan compute_astar_plan(
 
     const auto path = find_astar_path(origin, target, obstacles, config);
     if (!path.has_value()) {
-        return make_direct_plan(origin, target);
+        return {
+            heading_to(origin, target),
+            0.0,
+            0.0,
+            false,
+        };
     }
 
     const Position2 waypoint =
         select_waypoint(origin, target, path.value(), obstacles, config);
-    return {heading_to(origin, waypoint)};
+    const double clearance = minimum_waypoint_clearance(waypoint, obstacles, config);
+    return {
+        heading_to(origin, waypoint),
+        speed_scale_for_clearance(clearance, config),
+        clearance,
+        true,
+    };
 }
 
 }  // namespace
@@ -563,12 +760,6 @@ WalkPlan plan_walk(
     std::optional<double> opponent_x_threshold,
     bool avoid_field_boundaries,
     bool avoid_obstacles) {
-
-    const double dist = math::planar_dist(self_pos, target_pos);
-    if (dist < field_geometry::kNearTargetM) {
-        return {heading_to(self_pos, target_pos)};
-    }
-
     ObstacleBuffer obstacles;
     if (avoid_obstacles) {
         collect_obstacles(obstacles, snapshot, self_player_number, true, true, opponent_x_threshold);
@@ -583,9 +774,7 @@ WalkPlan plan_walk(
     config.protected_ap_obstacle_cost = kWalkProtectedApObstacleCost;
     config.lookahead_m = kWalkLookaheadM;
     config.avoid_field_boundaries = avoid_field_boundaries;
-    config.disable_forward_boundary = true;
-    const auto plan = compute_astar_plan(self_pos, target_pos, obstacles, config);
-    return {plan.heading_deg};
+    return compute_astar_plan(self_pos, target_pos, obstacles, config);
 }
 
 }  // namespace decision

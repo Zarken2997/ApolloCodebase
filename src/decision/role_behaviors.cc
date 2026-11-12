@@ -35,6 +35,14 @@ constexpr double kDribbleSideClearanceM = 0.55;
 constexpr double kDribbleSideStepBehindThresholdM = 0.1;
 constexpr double kDribbleMaxLateralOffsetM = 0.4;
 constexpr double kDribbleMaxAheadM = 0.15;
+constexpr double kDribbleRecoverDistanceM = 2.0;
+constexpr double kDribbleRecoverLateralM = 0.9;
+constexpr double kShotReleaseDepthM = 0.1;
+constexpr double kShotNoBacktrackDepthM = 1.5;
+// Keep the AP center on the playable side of the boundary while still leaving
+// enough room beyond the ball to execute the push rather than clamping the
+// target back onto the ball and stalling.
+constexpr double kDribbleFieldMarginM = 0.25;
 
 bool is_our_set_play(const world::WorldSnapshot& snapshot) {
     return snapshot.play_mode_group == world::PlayModeGroup::OurKick;
@@ -45,15 +53,6 @@ std::array<double, 2> role_position_from_blackboard(const Blackboard& blackboard
         return {0.0, 0.0};
     }
     return blackboard.get<std::array<double, 2>>(Blackboard::kKeyRolePos);
-}
-
-WalkCommand make_walk_command(const std::array<double, 2>& target_position_m) {
-    WalkCommand command;
-    command.target_2d_m = target_position_m;
-    command.target_absolute = true;
-    command.orientation_deg = std::nullopt;
-    command.orientation_absolute = true;
-    return command;
 }
 
 double walk_speed_command(double distance_m, double heading_error_abs_deg) {
@@ -108,16 +107,6 @@ WalkCommand make_walk_command_avoiding(
     const std::array<double, 2> self{snapshot.self.position_m[0], snapshot.self.position_m[1]};
     const double dist = math::planar_dist(self, target_position_m);
 
-    if (dist < field_geometry::kNearTargetM) {
-        WalkCommand command = make_walk_command(target_position_m);
-        command.orientation_deg = orient_to_ball
-            ? orientation_to_ball_from_self(snapshot)
-            : std::nullopt;
-        command.orientation_absolute = true;
-        command.role_id = role_id;
-        return command;
-    }
-
     const auto plan = plan_walk(
         self,
         target_position_m,
@@ -126,6 +115,18 @@ WalkCommand make_walk_command_avoiding(
         opponent_x_threshold,
         avoid_field_boundaries,
         avoid_obstacles);
+    if (!plan.path_available || plan.speed_scale <= 0.0) {
+        // A blocked planner is a stop condition, not a licence to walk through
+        // the obstacle. Keep turning toward the requested direction so the next
+        // perception tick can escape once the traffic clears.
+        WalkCommand command;
+        command.target_2d_m = {0.0, 0.0};
+        command.target_absolute = false;
+        command.orientation_deg = plan.heading_deg;
+        command.orientation_absolute = true;
+        command.role_id = role_id;
+        return command;
+    }
     const double heading_rad = math::deg_to_rad(plan.heading_deg);
     const double self_yaw_deg =
         world::FrameNormalizer::yaw_deg_from_quaternion_wxyz(snapshot.self.orientation_wxyz);
@@ -148,7 +149,8 @@ WalkCommand make_walk_command_avoiding(
     const bool strafe = suppress_heading_slowdown ||
                         (orient_to_ball && dist <= kStrafeMaxDistM);
     const double speed =
-        walk_speed_command(dist, strafe ? 0.0 : heading_error_abs_deg);
+        walk_speed_command(dist, strafe ? 0.0 : heading_error_abs_deg) *
+        plan.speed_scale;
 
     WalkCommand command;
     command.target_2d_m = {speed * std::cos(rel_heading), speed * std::sin(rel_heading)};
@@ -184,6 +186,18 @@ struct GKDecisionContext {
 
 using GKNodePtr = bt::NodePtr<GKDecisionContext>;
 
+WalkCommand make_hold_position_command(
+    const APDecisionContext& context,
+    double heading_deg = 0.0) {
+    WalkCommand hold;
+    hold.target_2d_m = context.self;
+    hold.target_absolute = true;
+    hold.orientation_deg = heading_deg;
+    hold.orientation_absolute = true;
+    hold.role_id = RoleManager::ROLE_AP;
+    return hold;
+}
+
 WalkCommand make_dribble_command(
     APDecisionContext& context,
     double absolute_direction_deg) {
@@ -193,14 +207,18 @@ WalkCommand make_dribble_command(
         std::sin(direction_rad),
     };
     const std::array<double, 2> perpendicular{-direction[1], direction[0]};
-    const std::array<double, 2> setup_target{
+    const std::array<double, 2> setup_target = field_geometry::clamp_position_to_field({
         context.ball[0] - direction[0] * kDribbleSetupDistanceM,
         context.ball[1] - direction[1] * kDribbleSetupDistanceM,
-    };
-    const std::array<double, 2> push_target{
+    }, field_geometry::kActualHalfLengthM,
+       field_geometry::kActualHalfWidthM,
+       kDribbleFieldMarginM);
+    const std::array<double, 2> push_target = field_geometry::clamp_position_to_field({
         context.ball[0] + direction[0] * field_geometry::kPushPastBallM,
         context.ball[1] + direction[1] * field_geometry::kPushPastBallM,
-    };
+    }, field_geometry::kActualHalfLengthM,
+       field_geometry::kActualHalfWidthM,
+       kDribbleFieldMarginM);
     const std::array<double, 2> self_from_ball{
         context.self[0] - context.ball[0],
         context.self[1] - context.ball[1],
@@ -216,10 +234,12 @@ WalkCommand make_dribble_command(
     std::array<double, 2> approach_target = setup_target;
     if (needs_side_step) {
         const double side_sign = signed_lateral_offset < 0.0 ? -1.0 : 1.0;
-        approach_target = {
+        approach_target = field_geometry::clamp_position_to_field({
             context.ball[0] + perpendicular[0] * side_sign * kDribbleSideDistanceM,
             context.ball[1] + perpendicular[1] * side_sign * kDribbleSideDistanceM,
-        };
+        }, field_geometry::kActualHalfLengthM,
+           field_geometry::kActualHalfWidthM,
+           kDribbleFieldMarginM);
     }
     const bool setup_ready =
         math::planar_dist(context.self, setup_target) <= kDribbleSetupToleranceM;
@@ -228,26 +248,58 @@ WalkCommand make_dribble_command(
         context.state.dribble_ready = true;
     }
 
+    // Keep the push phase latched while the ball is still reachable in front of
+    // the robot. Releasing at the original 1 m engage radius made the AP switch
+    // to a setup point behind the rolling ball, which read as an immediate
+    // forward/backward oscillation during a shot.
     const bool push_position_valid =
         along_direction <= kDribbleMaxAheadM &&
-        lateral_offset <= kDribbleMaxLateralOffsetM &&
-        context.ball_distance <= field_geometry::kPushBallEngageDistanceM;
+        lateral_offset <= kDribbleRecoverLateralM &&
+        context.ball_distance <= kDribbleRecoverDistanceM;
     if (context.state.dribble_ready && !push_position_valid) {
         context.state.dribble_ready = false;
     }
 
     if (!context.state.dribble_ready) {
+        // Once the ball is in the final shooting strip, a lost push latch must
+        // not send the robot back to a setup point behind the ball. Stop and let
+        // the remaining ball motion finish; reverse motion here cancels the
+        // forward impulse and is the visible shot oscillation.
+        const bool in_shot_finish_zone =
+            direction[0] > 0.5 &&
+            context.ball[0] >=
+                field_geometry::kActualHalfLengthM - kShotNoBacktrackDepthM;
+        if (in_shot_finish_zone) {
+            return make_hold_position_command(context, absolute_direction_deg);
+        }
         WalkCommand approach_command = make_walk_command_avoiding(
             approach_target, context.snapshot, std::nullopt, true, true,
-            RoleManager::ROLE_AP, true, false);
+            RoleManager::ROLE_AP, true, true);
         approach_command.orientation_deg = absolute_direction_deg;
         approach_command.orientation_absolute = true;
         return approach_command;
     }
 
-    return make_walk_command_avoiding(
+    WalkCommand push_command = make_walk_command_avoiding(
         push_target, context.snapshot, std::nullopt, true, true,
-        RoleManager::ROLE_AP, false, false);
+        RoleManager::ROLE_AP, false, true);
+
+    // The field boundary may clamp the geometric push target behind the robot
+    // after the ball has already rolled ahead. Never convert that clamp into a
+    // reverse command: stop at the safe boundary and let the ball's momentum
+    // finish the shot.
+    const double yaw_deg =
+        world::FrameNormalizer::yaw_deg_from_quaternion_wxyz(
+            context.snapshot.self.orientation_wxyz);
+    const std::array<double, 2> world_velocity =
+        math::rotate_2d(push_command.target_2d_m, yaw_deg);
+    const double forward_velocity =
+        world_velocity[0] * direction[0] +
+        world_velocity[1] * direction[1];
+    if (forward_velocity < 0.0) {
+        push_command.target_2d_m = {0.0, 0.0};
+    }
+    return push_command;
 }
 
 WalkCommand make_ap_push_ball_to_goal(APDecisionContext& context) {
@@ -271,6 +323,14 @@ WalkCommand make_ap_push_ball_to_goal(APDecisionContext& context) {
     const double absolute_direction_deg = math::norm2(goal_direction) > 1e-6
         ? math::vector_angle_deg(goal_direction)
         : 0.0;
+
+    const double goal_plane_x = field_geometry::kActualHalfLengthM;
+    if (context.ball[0] >= goal_plane_x - kShotReleaseDepthM) {
+        return make_hold_position_command(context);
+    }
+    if (goal_direction[0] <= 0.0) {
+        return make_hold_position_command(context);
+    }
     return make_dribble_command(context, absolute_direction_deg);
 }
 
@@ -285,20 +345,20 @@ WalkCommand make_gk_walk_to_ball(GKDecisionContext& context) {
         RoleManager::ROLE_GK);
 }
 
-HighLevelCommand make_gk_hold_position(GKDecisionContext& /*context*/) {
+HighLevelCommand make_gk_hold_position(GKDecisionContext& context) {
     // Stay parked at the keeper's hold point (kGkHoldDepthM in front of our
     // goal line, on the centerline).
     const std::array<double, 2> target{
         -field_geometry::kActualHalfLengthM + field_geometry::kGkHoldDepthM,
         0.0,
     };
-    WalkCommand command;
-    command.target_2d_m = target;
-    command.target_absolute = true;
-    command.orientation_deg = std::nullopt;
-    command.orientation_absolute = true;
-    command.role_id = RoleManager::ROLE_GK;
-    return command;
+    return make_avoiding_walk_command(
+        target,
+        context.snapshot,
+        std::nullopt,
+        true,
+        true,
+        RoleManager::ROLE_GK);
 }
 
 const APBehavior& ap_behavior_instance() {
@@ -307,27 +367,27 @@ const APBehavior& ap_behavior_instance() {
 }
 
 const SimpleRoleBehavior& cbm_behavior_instance() {
-    static const SimpleRoleBehavior instance{RoleManager::ROLE_CBM, false};
+    static const SimpleRoleBehavior instance{RoleManager::ROLE_CBM};
     return instance;
 }
 
 const SimpleRoleBehavior& st_behavior_instance() {
-    static const SimpleRoleBehavior instance{RoleManager::ROLE_ST, false};
+    static const SimpleRoleBehavior instance{RoleManager::ROLE_ST};
     return instance;
 }
 
 const SimpleRoleBehavior& cbl_behavior_instance() {
-    static const SimpleRoleBehavior instance{RoleManager::ROLE_CBL, true};
+    static const SimpleRoleBehavior instance{RoleManager::ROLE_CBL};
     return instance;
 }
 
 const SimpleRoleBehavior& cbr_behavior_instance() {
-    static const SimpleRoleBehavior instance{RoleManager::ROLE_CBR, true};
+    static const SimpleRoleBehavior instance{RoleManager::ROLE_CBR};
     return instance;
 }
 
 const SimpleRoleBehavior& cdm_behavior_instance() {
-    static const SimpleRoleBehavior instance{RoleManager::ROLE_CDM, false};
+    static const SimpleRoleBehavior instance{RoleManager::ROLE_CDM};
     return instance;
 }
 
@@ -337,6 +397,26 @@ const GKBehavior& gk_behavior_instance() {
 }
 
 }  // namespace
+
+WalkCommand make_avoiding_walk_command(
+    const std::array<double, 2>& target_position_m,
+    const world::WorldSnapshot& snapshot,
+    std::optional<double> opponent_x_threshold,
+    bool avoid_field_boundaries,
+    bool orient_to_ball,
+    std::optional<int> role_id,
+    bool suppress_heading_slowdown,
+    bool avoid_obstacles) {
+    return make_walk_command_avoiding(
+        target_position_m,
+        snapshot,
+        opponent_x_threshold,
+        avoid_field_boundaries,
+        orient_to_ball,
+        role_id,
+        suppress_heading_slowdown,
+        avoid_obstacles);
+}
 
 int current_role_from_blackboard(const Blackboard& blackboard) {
     return blackboard.exists(Blackboard::kKeyCurrentRole)
@@ -416,12 +496,8 @@ HighLevelCommand SimpleRoleBehavior::make_command(
         relay_state_ = {};
     }
 
-    std::optional<double> opponent_x_threshold;
-    if (defensive_opponent_clip_) {
-        opponent_x_threshold = snapshot.ball.position_m[0] - 1.0;
-    }
     return make_walk_command_avoiding(
-        role_position_from_blackboard(blackboard), snapshot, opponent_x_threshold);
+        role_position_from_blackboard(blackboard), snapshot);
 }
 
 bool GKBehavior::matches(const Blackboard& blackboard) const {

@@ -202,6 +202,70 @@ server ──► world ──► decision ──► behavior ──► motor act
 
 </details>
 
+## Obstacle-Aware Movement
+
+All moving role commands now share one collision envelope. `world/` estimates
+player planar velocity from consecutive fresh observations. `walk_planner`
+expands every opponent into a swept segment from its observed position to its
+0.6-second prediction, so crossing and head-on traffic is considered before
+the robot reaches it. An obstacle that has not been refreshed is not treated as
+a precise point: its hard and soft radii grow by 0.35 m per second of observation
+age, capped at 2 seconds.
+
+The A* planner returns more than a heading:
+
+- `path_available` distinguishes a real collision-free route from planning
+  failure.
+- `minimum_clearance_m` reports distance from the selected waypoint to the
+  nearest hard-obstacle boundary.
+- `speed_scale` reduces translation speed gradually to 20% near the hard
+  boundary and reaches zero when the clearance disappears.
+
+The planner first tries the requested tactical target. If that cell is occupied,
+it searches a local ring for the nearest traversable goal instead of steering
+into the obstacle. A closed obstacle ring returns `path_available=false`; the
+role layer then commands zero planar velocity while retaining the ability to
+turn. The field's front boundary is enforced together with the other three
+sides, and AP setup/push targets are clamped inside the playable field.
+
+`decision::make_avoiding_walk_command` is the common movement entry for open
+play, set plays, goalkeeper positioning, and AP ball approach/push. The only
+remaining direct target command is the explicit in-place hold used while the
+server waits for a kickoff.
+
+AP shooting uses a separate forward-intent guard after A* produces its command.
+The field boundary may clamp the geometric push target, but it may not turn that
+clamp into a reverse velocity. During a push, the AP retains its push phase while
+the ball is reachable ahead, stops at the safe field limit if no forward room
+remains, and stops chasing once the ball reaches the opponent goal plane. This
+prevents the target from alternating between the rolling ball and a setup point
+behind it during a shot.
+
+Run the independent planner checks with:
+
+```bash
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I. \
+  tests/obstacle_avoidance_test.cc src/decision/walk_planner.cc \
+  -o /tmp/apollo_obstacle_avoidance_test
+/tmp/apollo_obstacle_avoidance_test
+```
+
+Run the AP shot/boundary sequence check after building:
+
+```bash
+c++ -std=c++17 -Wall -Wextra -Wpedantic -I. \
+  tests/shot_boundary_avoidance_test.cc \
+  build/libdecision_core.a build/libworld_core.a build/librobot_core.a \
+  -o /tmp/apollo_shot_boundary_avoidance_test
+/tmp/apollo_shot_boundary_avoidance_test
+```
+
+These checks cover clear paths, static and moving obstacles, occupied tactical
+targets, closed obstacle rings, stale-observation expansion, field-target
+clamping, and monotonic AP shot progress through the front field boundary and
+goal plane. The organizer's standard simulator scenes and recorded match results
+remain the authoritative end-to-end evaluation.
+
 ## Runtime Assets
 
 `assets/` is the single runtime asset root:

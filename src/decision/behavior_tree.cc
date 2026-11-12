@@ -44,26 +44,6 @@ bool is_set_play_mode(const BehaviorContext& context) {
            context.snapshot.play_mode_group == world::PlayModeGroup::TheirKick;
 }
 
-// Humanoid robots walk forward only, so while farther than kFaceTargetRadiusM
-// from the destination they must face the direction of travel; once on station
-// they face a fixed point (the ball, or the goal to pre-aim a kick). Returns
-// std::nullopt when the facing target is degenerate (coincides with the
-// reference point), leaving the orientation unset.
-constexpr double kFaceTargetRadiusM = 0.5;
-
-std::optional<double> walk_facing_orientation_deg(
-    const std::array<double, 2>& self,
-    const std::array<double, 2>& destination,
-    const std::array<double, 2>& face_when_close) {
-    const bool far = math::planar_dist(self, destination) > kFaceTargetRadiusM;
-    const std::array<double, 2> from = far ? self : destination;
-    const std::array<double, 2> to = far ? destination : face_when_close;
-    if (math::sq_dist2(to, from) < 1e-6) {
-        return std::nullopt;
-    }
-    return math::vector_angle_deg(math::vec2_sub(to, from));
-}
-
 WalkCommand walk_to_current_role_position(BehaviorContext& context) {
     const int role_id = current_role_from_blackboard(context.blackboard);
     const auto role_pos = context.blackboard.exists(Blackboard::kKeyRolePos)
@@ -73,23 +53,17 @@ WalkCommand walk_to_current_role_position(BehaviorContext& context) {
         context.snapshot.ball.position_m[0],
         context.snapshot.ball.position_m[1],
     };
-    const std::array<double, 2> self_position{
-        context.snapshot.self.position_m[0],
-        context.snapshot.self.position_m[1],
-    };
     const auto legal_role_pos =
         field_geometry::legalize_set_play_target(role_pos, ball_position, context.snapshot.play_mode);
     context.blackboard.set(Blackboard::kKeyRolePos, legal_role_pos);
 
-    WalkCommand command;
-    command.target_2d_m = legal_role_pos;
-    command.target_absolute = true;
-    command.role_id = role_id;
-
-    command.orientation_deg =
-        walk_facing_orientation_deg(self_position, legal_role_pos, ball_position);
-    command.orientation_absolute = true;
-    return command;
+    return make_avoiding_walk_command(
+        legal_role_pos,
+        context.snapshot,
+        std::nullopt,
+        true,
+        true,
+        role_id);
 }
 
 HighLevelCommand make_beam_command(BehaviorContext& context) {

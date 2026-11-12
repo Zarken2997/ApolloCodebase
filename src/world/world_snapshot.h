@@ -44,6 +44,9 @@ struct PlayerObservation {
     double last_seen_time{-1.0};
     bool fallen{false};
     Vec3 position_m{0.0, 0.0, 0.0};
+    /// Canonical-frame planar velocity estimated from consecutive observations.
+    Vec3 velocity_mps{0.0, 0.0, 0.0};
+    bool velocity_valid{false};
     int comm_role{-1};  // role reported via team comm, -1 if unknown
 };
 

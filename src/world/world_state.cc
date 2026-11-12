@@ -63,6 +63,42 @@ bool has_close_position(
     return false;
 }
 
+Vec3 estimate_planar_velocity(
+    const Vec3& previous_position_m,
+    const Vec3& current_position_m,
+    double previous_time_s,
+    double current_time_s,
+    const Vec3& previous_velocity_mps,
+    bool previous_velocity_valid) {
+    constexpr double kMinSampleDtS = 1.0e-3;
+    constexpr double kMaxSampleDtS = 0.5;
+    constexpr double kMaxPlayerSpeedMps = 4.0;
+    constexpr double kVelocityAlpha = 0.5;
+
+    const double dt = current_time_s - previous_time_s;
+    if (previous_time_s < 0.0 || dt < kMinSampleDtS || dt > kMaxSampleDtS) {
+        return {0.0, 0.0, 0.0};
+    }
+
+    const Vec3 measured{
+        (current_position_m[0] - previous_position_m[0]) / dt,
+        (current_position_m[1] - previous_position_m[1]) / dt,
+        0.0,
+    };
+    const double speed = math::norm3(measured);
+    if (speed > kMaxPlayerSpeedMps) {
+        return {0.0, 0.0, 0.0};
+    }
+    if (!previous_velocity_valid) {
+        return measured;
+    }
+    return {
+        kVelocityAlpha * measured[0] + (1.0 - kVelocityAlpha) * previous_velocity_mps[0],
+        kVelocityAlpha * measured[1] + (1.0 - kVelocityAlpha) * previous_velocity_mps[1],
+        0.0,
+    };
+}
+
 double joint_or(const SelfState& self, const char* name) {
     const auto it = self.joint_positions_deg.find(name);
     return it != self.joint_positions_deg.end() ? it->second : 0.0;
@@ -155,6 +191,14 @@ void WorldState::update_from_perception(
             // on a set play, so clear the opponent gate too and re-seed from the
             // next detection instead of rejecting the jump as a phantom.
             std::fill(last_opponent_time_.begin(), last_opponent_time_.end(), -1.0);
+            for (auto& teammate : snapshot_.teammates) {
+                teammate.velocity_mps = {0.0, 0.0, 0.0};
+                teammate.velocity_valid = false;
+            }
+            for (auto& opponent : snapshot_.opponents) {
+                opponent.velocity_mps = {0.0, 0.0, 0.0};
+                opponent.velocity_valid = false;
+            }
             // Enter corner-probe so we can disambiguate which of the four
             // corners the ball sits at. The server mode only tells us the
             // kicker's side; the top/bottom corner has to be observed.
@@ -423,9 +467,22 @@ void WorldState::update_from_perception(
         if (is_teammate) {
             // Teammate vision positions are corroborated by exact self-reports
             // over team comm, so leave them raw (no per-slot gate state kept).
+            const Vec3 previous_position = bucket[idx].position_m;
+            const double previous_time = bucket[idx].last_seen_time;
+            const Vec3 previous_velocity = bucket[idx].velocity_mps;
+            const bool previous_velocity_valid = bucket[idx].velocity_valid;
             bucket[idx].seen = true;
             bucket[idx].position_m = player_world;
             bucket[idx].last_seen_time = snapshot_.server_time;
+            bucket[idx].velocity_mps = estimate_planar_velocity(
+                previous_position,
+                player_world,
+                previous_time,
+                snapshot_.server_time,
+                previous_velocity,
+                previous_velocity_valid);
+            bucket[idx].velocity_valid =
+                math::norm3(bucket[idx].velocity_mps) > 1.0e-6;
             continue;
         }
 
@@ -448,6 +505,15 @@ void WorldState::update_from_perception(
                   math::vec3_scale(player_world, kOpponentEmaAlpha),
                   math::vec3_scale(last_opponent_position_m_[idx], 1.0 - kOpponentEmaAlpha))
             : player_world;
+        bucket[idx].velocity_mps = estimate_planar_velocity(
+            last_opponent_position_m_[idx],
+            filtered,
+            last_opponent_time_[idx],
+            snapshot_.server_time,
+            bucket[idx].velocity_mps,
+            bucket[idx].velocity_valid);
+        bucket[idx].velocity_valid =
+            math::norm3(bucket[idx].velocity_mps) > 1.0e-6;
         bucket[idx].seen = true;
         bucket[idx].position_m = filtered;
         bucket[idx].last_seen_time = snapshot_.server_time;
@@ -478,6 +544,8 @@ void WorldState::set_team_comm_snapshot(const comm::TeamCommSnapshot& comm_snaps
         if (!mate.seen) {
             mate.position_m = {record.self_x_m, record.self_y_m, 0.5};
             mate.last_seen_time = snapshot_.server_time;
+            mate.velocity_mps = {0.0, 0.0, 0.0};
+            mate.velocity_valid = false;
         }
     }
 

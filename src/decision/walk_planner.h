@@ -6,19 +6,28 @@
 #include "src/world/world_snapshot.h"
 
 #include <array>
+#include <limits>
 #include <optional>
 
 namespace decision {
 
-/// Obstacle-aware heading produced by the local walk planner.
+/// Obstacle-aware heading and safety envelope produced by the local walk planner.
 struct WalkPlan {
-    double heading_deg;
+    double heading_deg{0.0};
+    /// Multiplicative speed limit in [0, 1] derived from path clearance.
+    double speed_scale{1.0};
+    /// Clearance from the selected waypoint to the nearest hard-obstacle boundary.
+    double minimum_clearance_m{std::numeric_limits<double>::infinity()};
+    /// False means no collision-free escape/approach path was found this cycle.
+    bool path_available{true};
 };
 
-/// Computes an obstacle-avoiding walk heading using grid A*.
+/// Computes an obstacle-avoiding walk command envelope using grid A*.
 ///
-/// All nearby players are obstacles unless `avoid_obstacles` is false. Speed is
-/// scheduled by the caller; this function only chooses the heading.
+/// All nearby players are swept obstacles unless `avoid_obstacles` is false.
+/// Fresh opponent velocities are predicted over the planning horizon, and stale
+/// observations grow their hard radius with age. The caller multiplies its base
+/// speed by `speed_scale` and stops translation when `path_available` is false.
 WalkPlan plan_walk(
     const std::array<double, 2>& self_pos,
     const std::array<double, 2>& target_pos,

@@ -44,6 +44,18 @@ inline constexpr double kFormationFieldMarginM = 0.7;
 // the actual field edge.
 inline constexpr double kWalkPlannerFieldMarginM = 1.5;
 
+/// Keeps a target inside the playable field with robot-size safety margin.
+inline Position2 clamp_position_to_field(
+    const Position2& position,
+    double half_length_m = kActualHalfLengthM,
+    double half_width_m = kActualHalfWidthM,
+    double margin_m = kFormationFieldMarginM) {
+    return {
+        std::clamp(position[0], -half_length_m + margin_m, half_length_m - margin_m),
+        std::clamp(position[1], -half_width_m + margin_m, half_width_m - margin_m),
+    };
+}
+
 inline constexpr std::array<Position2, 7> kBasePlayerPoses{{
     {-14.5, 0.0},
     {-10.0, 3.0},
